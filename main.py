@@ -24,6 +24,7 @@ class Job(TypedDict):
     location: Location
     updated_at: str
     absolute_url: str
+    company: Optional[str]
 
 @dataclass
 class ScannerConfig:
@@ -50,7 +51,12 @@ class GreenhouseJobScanner:
         self.config = config
         
         # Base URLs for Greenhouse API
-        self.base_url: str = "https://boards-api.greenhouse.io/v1/boards/anthropic"
+        self.url_config = [
+            {"url": "https://boards-api.greenhouse.io/v1/boards/deepmind",
+             "company": "Deepmind"},
+            {"url": "https://boards-api.greenhouse.io/v1/boards/anthropic",
+             "company": "Anthropic"},
+        ]
         
         # Redis setup - use mock if testing
         if config.use_redis:
@@ -62,27 +68,35 @@ class GreenhouseJobScanner:
 
     def fetch_jobs(self) -> List[Job]:
         """Fetch all jobs from Greenhouse API"""
-        try:
-            dept_response: requests.Response = requests.get(f"{self.base_url}/departments")
-            dept_response.raise_for_status()
-            departments: List[Department] = dept_response.json()['departments']
-            
-            all_jobs: List[Job] = []
-            
-            for dept in departments:
-                if dept.get('jobs'):
-                    all_jobs.extend(dept['jobs'])
+        all_jobs: List[Job] = []
+        for config in self.url_config:
+            try:
+                base_url = config['url']
+                dept_response: requests.Response = requests.get(f"{base_url}/departments")
+                dept_response.raise_for_status()
+                departments: List[Department] = dept_response.json()['departments']
                 
-                if dept.get('children'):
-                    for child in dept['children']:
-                        if child.get('jobs'):
-                            all_jobs.extend(child['jobs'])
-            
-            return all_jobs
-            
-        except Exception as e:
-            print(f"Error fetching jobs: {e}")
-            return []
+                for dept in departments:
+                    # Handle jobs in the main department
+                    if dept.get('jobs'):
+                        for job in dept['jobs']:
+                            job_copy = dict(job)
+                            job_copy['company'] = config['company']
+                            all_jobs.append(job_copy)
+                    
+                    # Handle jobs in child departments
+                    if dept.get('children'):
+                        for child in dept['children']:
+                            if child.get('jobs'):
+                                for job in child['jobs']:
+                                    job_copy = dict(job)
+                                    job_copy['company'] = config['company']
+                                    all_jobs.append(job_copy)
+                                    
+            except Exception as e:
+                print(f"Error fetching jobs: {e}")
+    
+        return all_jobs
 
     def _check_title_keywords(self, job_title: str) -> bool:
         """Check if job title matches any required title keywords"""
@@ -100,12 +114,13 @@ class GreenhouseJobScanner:
         """Mark a job as seen"""
         self.redis.sadd('seen_jobs', job_url)
 
-    def send_email_alert(self, new_jobs: List[Job]) -> None:
+    def send_email_alert(self, new_jobs: List[Job]) -> bool:
         """Send email alert for new jobs"""
         email_body: str = "New job postings found:\n\n"
         
         for job in new_jobs:
             email_body += f"Title: {job['title']}\n"
+            email_body += f"Company: {job['company']}\n"
             email_body += f"Location: {job['location']['name']}\n"
             email_body += f"Apply here: {job['absolute_url']}\n"
             
@@ -116,20 +131,25 @@ class GreenhouseJobScanner:
         if not self.config.send_emails:
             print("\nEmail would have contained:")
             print(email_body)
-            return
+            return True  # Return True in test mode so jobs are marked as seen
 
         msg: MIMEText = MIMEText(email_body)
-        msg['Subject'] = f"New Anthropic Jobs Alert - {len(new_jobs)} new positions found"
+        msg['Subject'] = f"New Jobs Alert - {len(new_jobs)} new {"position" if len(new_jobs) == 1 else "positions"} found"
         msg['From'] = self.email_address
         msg['To'] = self.email_address
+
+        sent_email = False
 
         try:
             with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
                 server.login(self.email_address, self.email_password)
                 server.send_message(msg)
             print(f"Alert sent at {datetime.now()}")
+            sent_email = True
         except Exception as e:
             print(f"Failed to send email: {e}")
+
+        return sent_email
 
     def check_jobs(self) -> None:
         """Main function to check for new jobs"""
@@ -137,7 +157,7 @@ class GreenhouseJobScanner:
             print(f"Starting job scan at {datetime.now()}")
             all_jobs: List[Job] = self.fetch_jobs()
             new_jobs: List[Job] = []
-            
+
             for job in all_jobs:
                 # Check if the title matches keywords
                 if not self._check_title_keywords(job['title']):
@@ -148,10 +168,13 @@ class GreenhouseJobScanner:
                 # Check if we haven't seen this job before
                 if not self.is_job_seen(job_url):
                     new_jobs.append(job)
-                    self.mark_job_seen(job_url)
             
             if new_jobs:
-                self.send_email_alert(new_jobs)
+                # Only mark the jobs as seen if the email sent successfully
+                if self.send_email_alert(new_jobs):
+                    for job in new_jobs:
+                        self.mark_job_seen(job['absolute_url'])
+
                 print(f"Found and reported {len(new_jobs)} new jobs")
             else:
                 print("No new matching jobs found")
@@ -171,14 +194,11 @@ if __name__ == "__main__":
                       help='Keywords to filter job titles (case insensitive)')
     args = parser.parse_args()
 
-    # Convert title keywords to lowercase
-    title_keywords = [keyword.lower() for keyword in args.title_keywords]
-    
     # Configure based on arguments
     config = ScannerConfig(
         use_redis=not args.test,
         send_emails=not args.test and not args.no_email,
-        title_keywords=title_keywords
+        title_keywords=args.title_keywords
     )
     
     scanner = GreenhouseJobScanner(config)
