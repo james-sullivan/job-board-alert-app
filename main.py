@@ -171,7 +171,6 @@ class JobScanner:
                 compensation = job.get('compensationTierSummary', 'Not specified')
                 
                 job_data: Job = {
-                    'id': hash(job['id']) % (2**31),  # Convert UUID to stable integer hash
                     'title': job['title'],
                     'content': f"Team: {team_name}\nCompensation: {compensation}\nEmployment Type: {job.get('employmentType', 'Not specified')}",
                     'location': {'name': location_name},
