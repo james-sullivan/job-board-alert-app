@@ -18,7 +18,6 @@ class Department(TypedDict):
     children: Optional[List['Department']]
 
 class Job(TypedDict):
-    id: int
     title: str
     content: Optional[str]
     location: Location
@@ -43,22 +42,33 @@ class MockRedis:
     def sadd(self, key: str, value: str) -> None:
         self.seen_jobs.add(value)
 
-class GreenhouseJobScanner:
+class JobScanner:
     def __init__(self, config: ScannerConfig) -> None:
         self.email_address: str = os.getenv('EMAIL_ADDRESS', '')
         self.email_password: str = os.getenv('EMAIL_PASSWORD', '')
         self.title_keywords: List[str] = config.title_keywords
         self.config = config
         
-        # Base URLs for Greenhouse API
-        self.url_config = [
-            {"url": "https://boards-api.greenhouse.io/v1/boards/deepmind",
-             "company": "Deepmind"},
-            {"url": "https://boards-api.greenhouse.io/v1/boards/anthropic",
-             "company": "Anthropic"},
+        # API configurations
+        self.api_config = [
+            {
+                "type": "greenhouse",
+                "url": "https://boards-api.greenhouse.io/v1/boards/deepmind",
+                "company": "Deepmind"
+            },
+            {
+                "type": "greenhouse",
+                "url": "https://boards-api.greenhouse.io/v1/boards/anthropic",
+                "company": "Anthropic"
+            },
+            {
+                "type": "openai",
+                "url": "https://jobs.ashbyhq.com/api/non-user-graphql",
+                "company": "OpenAI"
+            }
         ]
         
-        # Redis setup - use mock if testing
+        # Redis setup
         if config.use_redis:
             redis_url: str = os.getenv('REDISCLOUD_URL', '')
             self.redis = redis.from_url(redis_url)
@@ -66,35 +76,130 @@ class GreenhouseJobScanner:
             print("Using mock Redis for testing")
             self.redis = MockRedis()
 
-    def fetch_jobs(self) -> List[Job]:
-        """Fetch all jobs from Greenhouse API"""
+    def fetch_greenhouse_jobs(self, config: Dict[str, str]) -> List[Job]:
+        """Fetch jobs from Greenhouse API"""
         all_jobs: List[Job] = []
-        for config in self.url_config:
-            try:
-                base_url = config['url']
-                dept_response: requests.Response = requests.get(f"{base_url}/departments")
-                dept_response.raise_for_status()
-                departments: List[Department] = dept_response.json()['departments']
+        try:
+            dept_response: requests.Response = requests.get(f"{config['url']}/departments")
+            dept_response.raise_for_status()
+            departments: List[Department] = dept_response.json()['departments']
+            
+            for dept in departments:
+                # Handle jobs in the main department
+                if dept.get('jobs'):
+                    for job in dept['jobs']:
+                        job_copy = dict(job)
+                        job_copy['company'] = config['company']
+                        all_jobs.append(job_copy)
                 
-                for dept in departments:
-                    # Handle jobs in the main department
-                    if dept.get('jobs'):
-                        for job in dept['jobs']:
-                            job_copy = dict(job)
-                            job_copy['company'] = config['company']
-                            all_jobs.append(job_copy)
-                    
-                    # Handle jobs in child departments
-                    if dept.get('children'):
-                        for child in dept['children']:
-                            if child.get('jobs'):
-                                for job in child['jobs']:
-                                    job_copy = dict(job)
-                                    job_copy['company'] = config['company']
-                                    all_jobs.append(job_copy)
-                                    
-            except Exception as e:
-                print(f"Error fetching jobs: {e}")
+                # Handle jobs in child departments
+                if dept.get('children'):
+                    for child in dept['children']:
+                        if child.get('jobs'):
+                            for job in child['jobs']:
+                                job_copy = dict(job)
+                                job_copy['company'] = config['company']
+                                all_jobs.append(job_copy)
+                                
+        except Exception as e:
+            print(f"Error fetching Greenhouse jobs for {config['company']}: {e}")
+        
+        return all_jobs
+
+    def fetch_openai_jobs(self, config: Dict[str, str]) -> List[Job]:
+        """Fetch jobs from OpenAI's API"""
+        all_jobs: List[Job] = []
+        try:
+            # OpenAI uses a GraphQL API
+            headers = {
+                "Content-Type": "application/json"
+            }
+            
+            # GraphQL query for jobs
+            payload = {
+                "operationName": "ApiJobBoardWithTeams",
+                "variables": {
+                    "organizationHostedJobsPageName": "openai"
+                },
+                "query": """
+                query ApiJobBoardWithTeams($organizationHostedJobsPageName: String!) {
+                  jobBoard: jobBoardWithTeams(
+                    organizationHostedJobsPageName: $organizationHostedJobsPageName
+                  ) {
+                    teams {
+                      id
+                      name
+                      parentTeamId
+                      __typename
+                    }
+                    jobPostings {
+                      id
+                      title
+                      teamId
+                      locationId
+                      locationName
+                      employmentType
+                      secondaryLocations {
+                        locationId
+                        locationName
+                        __typename
+                      }
+                      compensationTierSummary
+                      __typename
+                    }
+                    __typename
+                  }
+                }"""
+            }
+            
+            response = requests.post(config['url'], json=payload, headers=headers)
+            response.raise_for_status()
+            jobs_data = response.json()
+            
+            # Transform OpenAI job format to match our Job type
+            jobs_data = response.json()
+            
+            job_postings = jobs_data.get('data', {}).get('jobBoard', {}).get('jobPostings', [])
+            teams = {team['id']: team['name'] for team in jobs_data.get('data', {}).get('jobBoard', {}).get('teams', [])}
+            
+            for job in job_postings:
+                location_name = job.get('locationName', 'Remote')
+                if job.get('secondaryLocations'):
+                    location_name += f" + {len(job['secondaryLocations'])} other locations"
+                
+                team_name = teams.get(job.get('teamId'), '')
+                compensation = job.get('compensationTierSummary', 'Not specified')
+                
+                job_data: Job = {
+                    'id': hash(job['id']) % (2**31),  # Convert UUID to stable integer hash
+                    'title': job['title'],
+                    'content': f"Team: {team_name}\nCompensation: {compensation}\nEmployment Type: {job.get('employmentType', 'Not specified')}",
+                    'location': {'name': location_name},
+                    'updated_at': datetime.now().isoformat(),
+                    'absolute_url': f"https://jobs.ashbyhq.com/openai/{job['id']}",
+                    'company': config['company']
+                }
+                all_jobs.append(job_data)
+                
+        except Exception as e:
+            print(f"Error fetching OpenAI jobs: {e}")
+            
+        return all_jobs
+
+    def fetch_jobs(self) -> List[Job]:
+        """Fetch all jobs from configured APIs"""
+        all_jobs: List[Job] = []
+        
+        for config in self.api_config:
+            if config['type'] == 'greenhouse':
+                jobs = self.fetch_greenhouse_jobs(config)
+            elif config['type'] == 'openai':
+                jobs = self.fetch_openai_jobs(config)
+            else:
+                print(f"Unknown API type: {config['type']}")
+                continue
+                
+            all_jobs.extend(jobs)
     
         return all_jobs
 
@@ -123,15 +228,12 @@ class GreenhouseJobScanner:
             email_body += f"Company: {job['company']}\n"
             email_body += f"Location: {job['location']['name']}\n"
             email_body += f"Apply here: {job['absolute_url']}\n"
-            
-            if job.get('content'):
-                email_body += f"\nDescription: {job['content'][:200]}...\n"
             email_body += "\n" + "-"*50 + "\n\n"
 
         if not self.config.send_emails:
             print("\nEmail would have contained:")
             print(email_body)
-            return True  # Return True in test mode so jobs are marked as seen
+            return True
 
         msg: MIMEText = MIMEText(email_body)
         msg['Subject'] = f"New Jobs Alert - {len(new_jobs)} new {"position" if len(new_jobs) == 1 else "positions"} found"
@@ -201,5 +303,5 @@ if __name__ == "__main__":
         title_keywords=args.title_keywords
     )
     
-    scanner = GreenhouseJobScanner(config)
+    scanner = JobScanner(config)
     scanner.check_jobs()
