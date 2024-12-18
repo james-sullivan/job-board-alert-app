@@ -291,7 +291,7 @@ if __name__ == "__main__":
                       help='Run in test mode (no Redis, no emails)')
     parser.add_argument('--no-email', action='store_true',
                       help='Skip sending emails but use Redis')
-    parser.add_argument('--title-keywords', type=str, nargs='+', default=['engineer', 'fellow'],
+    parser.add_argument('--title-keywords', type=str, nargs='+', default=['engineer', 'fellow', 'resident', 'residency'],
                       help='Keywords to filter job titles (case insensitive)')
     args = parser.parse_args()
 
